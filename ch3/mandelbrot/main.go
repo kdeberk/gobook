@@ -1,0 +1,239 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"io"
+	"log"
+	"math"
+	"math/cmplx"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+)
+
+type fractalFunc func(complex128) color.RGBA
+
+type config struct {
+	x, y, zoom    float64
+	f             fractalFunc
+	supersampling bool
+	width, height int
+}
+
+var fractalFns map[string]fractalFunc
+
+func init() {
+	fractalFns = map[string]fractalFunc{
+		"mandelbrot": mandelbrot,
+		"z^3-1": createNewtonFunc(newtonFract{
+			func(z complex128) complex128 { return z*z*z - 1 },
+			func(z complex128) complex128 { return 3 * z * z },
+			[]complex128{
+				1,
+				complex(-.5, math.Sqrt(3)/2),
+				complex(-.5, -math.Sqrt(3)/2),
+			},
+			1,
+			1,
+		}),
+		"z^4-1": createNewtonFunc(newtonFract{
+			func(z complex128) complex128 { return z*z*z*z - 1 },
+			func(z complex128) complex128 { return 4 * z * z * z },
+			[]complex128{1, -1, 1i, -1i},
+			1,
+			1,
+		}),
+		"z^3-2z+2": createNewtonFunc(newtonFract{
+			func(z complex128) complex128 { return z*z*z - 2*z + 2 },
+			func(z complex128) complex128 { return 3*z*z - 2 },
+			[]complex128{
+				-1.7693,
+				0.88465 + -0.58974i,
+				0.88465 + 0.58974i,
+			},
+			1,
+			1,
+		}),
+	}
+}
+
+func main() {
+	http.HandleFunc("/fractal", handleRenderFractal)
+	log.Fatal(http.ListenAndServe("localhost:8080", nil))
+}
+
+func handleRenderFractal(w http.ResponseWriter, r *http.Request) {
+	err := r.ParseForm()
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	c, err := readConfig(r.Form)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	generateImage(w, c)
+}
+
+func readConfig(vs url.Values) (config, error) {
+	c := config{f: mandelbrot, x: 0.0, y: 0.0, zoom: 1, width: 1024, height: 1024}
+
+	if name := vs.Get("fractal"); name != "" {
+		f, ok := fractalFns[name]
+		if !ok {
+			var buffer bytes.Buffer
+			fmt.Fprintf(&buffer, "Unknown fractal %v, known:\n", name)
+			for name := range fractalFns {
+				fmt.Fprintf(&buffer, "- %v\n", name)
+			}
+			return config{}, fmt.Errorf(buffer.String())
+		}
+		c.f = f
+	}
+
+	if x := vs.Get("x"); x != "" {
+		x, err := strconv.ParseFloat(x, 64)
+		if err != nil {
+			return config{}, err
+		}
+		c.x = x
+	}
+
+	if y := vs.Get("y"); y != "" {
+		y, err := strconv.ParseFloat(y, 64)
+		if err != nil {
+			return config{}, err
+		}
+		c.y = y
+	}
+
+	if zoom := vs.Get("zoom"); zoom != "" {
+		zoom, err := strconv.ParseFloat(zoom, 64)
+		if err != nil {
+			return config{}, err
+		}
+		if zoom == 0.0 {
+			return config{}, fmt.Errorf("zoom needs to be non-zero")
+		}
+
+		c.zoom = zoom
+	}
+
+	if supersampling := vs.Get("supersampling"); supersampling != "" {
+		supersampling, err := strconv.ParseBool(supersampling)
+		if err != nil {
+			return config{}, err
+		}
+		c.supersampling = supersampling
+	}
+	return c, nil
+}
+
+func generateImage(w io.Writer, conf config) {
+	xmin := conf.x - 2/conf.zoom
+	xmax := conf.x + 2/conf.zoom
+	ymin := conf.y - 2/conf.zoom
+	ymax := conf.y + 2/conf.zoom
+	xres := float64(xmax-xmin) / float64(conf.width)
+	yres := float64(ymax-ymin) / float64(conf.height)
+
+	img := image.NewRGBA(image.Rect(0, 0, conf.width, conf.height))
+	for py := 0; py < conf.height; py++ {
+		y := float64(py)*yres + ymin
+		for px := 0; px < conf.width; px++ {
+			x := float64(px)*xres + xmin
+
+			var c color.Color
+			switch {
+			case conf.supersampling:
+				xx := xres / 4
+				yy := yres / 4
+
+				c = averageColor(
+					conf.f(complex(x-xx, y-yy)),
+					conf.f(complex(x-xx, y+yy)),
+					conf.f(complex(x+xx, y-yy)),
+					conf.f(complex(x+xx, y+yy)),
+				)
+			default:
+				c = conf.f(complex(x, y))
+			}
+			img.Set(px, py, c)
+		}
+	}
+	png.Encode(w, img)
+}
+
+func averageColor(colors ...color.RGBA) color.Color {
+	var r, g, b uint16
+	for _, c := range colors {
+		r += uint16(c.R)
+		g += uint16(c.G)
+		b += uint16(c.B)
+	}
+	return color.RGBA{uint8(r / 4), uint8(r / 4), uint8(r / 4), 0xFF}
+}
+
+func mandelbrot(z complex128) color.RGBA {
+	const iterations = 200
+
+	var v complex128
+	for n := 0; n < iterations; n++ {
+		v = v*v + z
+		if 2 < cmplx.Abs(v) {
+			q := 255 * (float64(n) / float64(iterations))
+			c := math.Max(0, math.Min(255, q))
+			if 128 <= c {
+				return color.RGBA{uint8(c), 0xFF, uint8(c), 0xFF}
+			}
+			return color.RGBA{0x00, uint8(c), 0x00, 0xFF}
+		}
+	}
+	return color.RGBA{0x00, 0x00, 0x00, 0xFF}
+}
+
+type newtonFract struct {
+	p     func(complex128) complex128
+	deriv func(complex128) complex128
+	roots []complex128
+	a, z  complex128
+}
+
+func createNewtonFunc(fract newtonFract) fractalFunc {
+	const (
+		iterations = 200
+		tolerance  = 0.00001
+	)
+	colors := [...]color.RGBA{
+		{0xFF, 0x00, 0x00, 0xFF}, // Red
+		{0x00, 0xFF, 0x00, 0xFF}, // Green
+		{0x00, 0x00, 0xFF, 0xFF}, // Blue
+		{0xFF, 0x00, 0xFF, 0xFF}, // Magenta
+		{0xFF, 0xFF, 0x00, 0xFF}, // Yellow
+	}
+
+	if len(colors) < len(fract.roots) {
+		fmt.Fprintf(os.Stderr, "Not enough colors for the roots: %v < %v", len(colors), len(fract.roots))
+		os.Exit(1)
+	}
+
+	return func(z complex128) color.RGBA {
+		for n := 0; n < iterations; n++ {
+			z -= fract.a * fract.p(z) / fract.deriv(z)
+
+			for i, root := range fract.roots {
+				if cmplx.Abs(z-root) < tolerance {
+					return colors[i]
+				}
+			}
+		}
+		return color.RGBA{0x00, 0x00, 0x00, 0xFF}
+	}
+}
