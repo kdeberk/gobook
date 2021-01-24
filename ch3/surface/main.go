@@ -84,18 +84,18 @@ func renderSVG(w io.Writer, f plotFn) {
 	fmt.Fprintf(w, "</svg>")
 }
 
-func corner(i, j int, f plotFn) (float64, float64, float64) {
+func corner(i, j int, f plotFn) (sx, sy, z float64) {
 	// Find point (x,y) at corner of cells (i,j).
 	x := xyrange * (float64(i)/cells - 0.5)
 	y := xyrange * (float64(j)/cells - 0.5)
 
 	// Compute surface height z.
-	z := f(x, y)
+	z = f(x, y)
 
 	// Project (x,y,z) isometrically onto 2D SVG canvas (sx,sy).
-	sx := width/2 + (x-y)*cos30*xyscale
-	sy := height/2 + (x+y)*sin30*xyscale - z*zscale
-	return sx, sy, z
+	sx = width/2 + (x-y)*cos30*xyscale
+	sy = height/2 + (x+y)*sin30*xyscale - z*zscale
+	return
 }
 
 // Ripple effect
