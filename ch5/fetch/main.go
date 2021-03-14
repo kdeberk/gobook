@@ -35,7 +35,7 @@ func fetch(url string) (filename string, n int64, err error) {
 		return "", 0, err
 	}
 	defer func() {
-		if closeErr := f.Close(); err == nil {
+		if closeErr := f.Close(); err != nil {
 			err = fmt.Errorf("when closing: %w", closeErr)
 		}
 	}()

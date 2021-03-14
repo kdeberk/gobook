@@ -1,4 +1,3 @@
-// Surface computes an SVG redering of a 3D surface function.
 package main
 
 import (
@@ -7,6 +6,6 @@ import (
 )
 
 func main() {
-	http.HandleFunc("/surface", handleRenderSVG)
+	http.HandleFunc("/surface", plot)
 	log.Fatal(http.ListenAndServe("localhost:8080", nil))
 }
