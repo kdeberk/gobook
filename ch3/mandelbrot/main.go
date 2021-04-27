@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -14,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"time"
 )
 
 type fractalFunc func(complex128) color.RGBA
@@ -23,6 +25,31 @@ type config struct {
 	f             fractalFunc
 	supersampling bool
 	width, height int
+	nworkers      int
+}
+
+func (cfg config) xmin() float64 {
+	return cfg.x - 2.0/cfg.zoom
+}
+
+func (cfg config) xmax() float64 {
+	return cfg.x + 2.0/cfg.zoom
+}
+
+func (cfg config) ymin() float64 {
+	return cfg.y - 2.0/cfg.zoom
+}
+
+func (cfg config) ymax() float64 {
+	return cfg.y + 2.0/cfg.zoom
+}
+
+func (cfg config) xres() float64 {
+	return (cfg.xmax() - cfg.xmin()) / float64(cfg.width)
+}
+
+func (cfg config) yres() float64 {
+	return (cfg.ymax() - cfg.ymin()) / float64(cfg.height)
 }
 
 var fractalFns map[string]fractalFunc
@@ -68,22 +95,27 @@ func main() {
 }
 
 func handleRenderFractal(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	defer func() {
+		fmt.Printf("took %v\n", time.Since(start))
+	}()
+
 	err := r.ParseForm()
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	c, err := readConfig(r.Form)
+	cfg, err := readConfig(r.Form)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	generateImage(w, c)
+	generateImage(r.Context(), cfg, w)
 }
 
 func readConfig(vs url.Values) (config, error) {
-	c := config{f: mandelbrot, x: 0.0, y: 0.0, zoom: 1, width: 1024, height: 1024}
+	c := config{f: mandelbrot, x: 0.0, y: 0.0, zoom: 1, width: 1024, height: 1024, nworkers: 16}
 
 	if name := vs.Get("fractal"); name != "" {
 		f, ok := fractalFns[name]
@@ -114,6 +146,18 @@ func readConfig(vs url.Values) (config, error) {
 		c.y = y
 	}
 
+	if factor := vs.Get("factor"); factor != "" {
+		factor, err := strconv.ParseInt(factor, 10, 64)
+		if err != nil {
+			return config{}, err
+		}
+		if factor == 0 {
+			return config{}, fmt.Errorf("factor needs to be non-zero")
+		}
+		c.width *= int(factor)
+		c.height *= int(factor)
+	}
+
 	if zoom := vs.Get("zoom"); zoom != "" {
 		zoom, err := strconv.ParseFloat(zoom, 64)
 		if err != nil {
@@ -136,39 +180,69 @@ func readConfig(vs url.Values) (config, error) {
 	return c, nil
 }
 
-func generateImage(w io.Writer, conf config) {
-	xmin := conf.x - 2/conf.zoom
-	xmax := conf.x + 2/conf.zoom
-	ymin := conf.y - 2/conf.zoom
-	ymax := conf.y + 2/conf.zoom
-	xres := float64(xmax-xmin) / float64(conf.width)
-	yres := float64(ymax-ymin) / float64(conf.height)
+func generateImage(ctx context.Context, cfg config, w io.Writer) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	img := image.NewRGBA(image.Rect(0, 0, conf.width, conf.height))
-	for py := 0; py < conf.height; py++ {
-		y := float64(py)*yres + ymin
-		for px := 0; px < conf.width; px++ {
-			x := float64(px)*xres + xmin
+	in := make(chan result, cfg.nworkers)
+	out := make(chan result, cfg.nworkers)
+	for i := 0; i < cfg.nworkers; i++ {
+		go worker(ctx, cfg, in, out)
+	}
 
-			var c color.Color
+	img := image.NewRGBA(image.Rect(0, 0, cfg.width, cfg.height))
+	go func() {
+		for py := 0; py < cfg.height; py++ {
+			for px := 0; px < cfg.width; px++ {
+				in <- result{px: px, py: py}
+			}
+		}
+	}()
+
+	for needed := cfg.height * cfg.width; 0 < needed; needed-- {
+		r := <-out
+		img.Set(r.px, r.py, r.c)
+	}
+	png.Encode(w, img)
+}
+
+type result struct {
+	px, py int
+	x, y   float64
+	c      color.Color
+}
+
+func worker(ctx context.Context, cfg config, in <-chan result, out chan<- result) {
+	xmin := cfg.ymin()
+	ymin := cfg.ymin()
+	xres := cfg.xres()
+	yres := cfg.yres()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case r := <-in:
+			x := float64(r.px)*xres + xmin
+			y := float64(r.py)*yres + ymin
+
 			switch {
-			case conf.supersampling:
+			case cfg.supersampling:
 				xx := xres / 4
 				yy := yres / 4
 
-				c = averageColor(
-					conf.f(complex(x-xx, y-yy)),
-					conf.f(complex(x-xx, y+yy)),
-					conf.f(complex(x+xx, y-yy)),
-					conf.f(complex(x+xx, y+yy)),
+				r.c = averageColor(
+					cfg.f(complex(x-xx, y-yy)),
+					cfg.f(complex(x-xx, y+yy)),
+					cfg.f(complex(x+xx, y-yy)),
+					cfg.f(complex(x+xx, y+yy)),
 				)
 			default:
-				c = conf.f(complex(x, y))
+				r.c = cfg.f(complex(x, y))
 			}
-			img.Set(px, py, c)
+			out <- r
 		}
 	}
-	png.Encode(w, img)
 }
 
 func averageColor(colors ...color.RGBA) color.Color {
